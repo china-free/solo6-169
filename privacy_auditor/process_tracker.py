@@ -1,7 +1,35 @@
 import psutil
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set, Tuple, NamedTuple
 import socket
 import ipaddress
+from dataclasses import dataclass
+
+
+TCP_DYING_STATES = {
+    'TIME_WAIT', 'CLOSE_WAIT', 'FIN_WAIT1', 'FIN_WAIT2',
+    'CLOSING', 'LAST_ACK', 'CLOSED', 'DELETE_TCB', 'NONE'
+}
+
+TCP_ACTIVE_STATES = {
+    'ESTABLISHED', 'SYN_SENT', 'SYN_RECV'
+}
+
+
+@dataclass(frozen=True)
+class ConnectionTuple:
+    protocol: str
+    local_ip: str
+    local_port: int
+    remote_ip: str
+    remote_port: int
+
+    @property
+    def key(self) -> Tuple[str, str, int, str, int]:
+        return (self.protocol, self.local_ip, self.local_port, self.remote_ip, self.remote_port)
+
+    @property
+    def reverse_key(self) -> Tuple[str, str, int, str, int]:
+        return (self.protocol, self.remote_ip, self.remote_port, self.local_ip, self.local_port)
 
 
 class ProcessTracker:
@@ -93,3 +121,56 @@ class ProcessTracker:
 
     def poll_connections(self) -> List[Dict[str, Any]]:
         return self.get_connections()
+
+    def get_active_connection_tuples(
+        self,
+        include_dying: bool = False
+    ) -> Set[ConnectionTuple]:
+        if not self._process:
+            self.find_process()
+        tuples: Set[ConnectionTuple] = set()
+        try:
+            for conn in self._process.net_connections(kind='inet'):
+                if not conn.laddr or not conn.raddr:
+                    continue
+                proto = 'TCP' if conn.type == socket.SOCK_STREAM else 'UDP'
+                status = conn.status or 'NONE'
+                if proto == 'TCP' and not include_dying and status in TCP_DYING_STATES:
+                    continue
+                tuples.add(ConnectionTuple(
+                    protocol=proto,
+                    local_ip=conn.laddr.ip,
+                    local_port=conn.laddr.port,
+                    remote_ip=conn.raddr.ip,
+                    remote_port=conn.raddr.port
+                ))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return tuples
+
+    @staticmethod
+    def connection_tuple_from_packet(
+        protocol: str,
+        src_ip: str,
+        src_port: int,
+        dst_ip: str,
+        dst_port: int,
+        local_ips: Set[str]
+    ) -> Optional[ConnectionTuple]:
+        if src_ip in local_ips:
+            return ConnectionTuple(
+                protocol=protocol,
+                local_ip=src_ip,
+                local_port=src_port,
+                remote_ip=dst_ip,
+                remote_port=dst_port
+            )
+        elif dst_ip in local_ips:
+            return ConnectionTuple(
+                protocol=protocol,
+                local_ip=dst_ip,
+                local_port=dst_port,
+                remote_ip=src_ip,
+                remote_port=src_port
+            )
+        return None
