@@ -5,19 +5,20 @@ from typing import List, Dict, Any, Optional, Set, Tuple
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-try:
-    from scapy.all import sniff, IP, TCP, UDP, Raw, IPv6
-    SCAPY_AVAILABLE = True
-except ImportError:
-    SCAPY_AVAILABLE = False
-
 import psutil
 
 from .process_tracker import ProcessTracker, ConnectionTuple
+from .capture_engine import (
+    CaptureEngine,
+    RawPacketMeta,
+    get_best_engine,
+    SubprocessDumpcapEngine
+)
 
 
 GRACE_PERIOD_SECONDS = 10.0
 CONNECTION_POLL_INTERVAL = 1.0
+BPF_REFRESH_INTERVAL = 5.0
 
 
 class PacketRecord:
@@ -94,18 +95,27 @@ class ConnectionTracker:
         self._states: Dict[Tuple[str, str, int, str, int], _ConnectionState] = {}
         self._grace_seconds = grace_seconds
         self._lock = threading.Lock()
+        self._changed = threading.Event()
 
-    def sync_from(self, current_tuples: Set[ConnectionTuple]):
+    def sync_from(self, current_tuples: Set[ConnectionTuple]) -> bool:
+        changed = False
         current_keys = {ct.key for ct in current_tuples}
         with self._lock:
+            existing_keys = set(self._states.keys())
+            new_keys = current_keys - existing_keys
+            removed_keys = existing_keys - current_keys
+            if new_keys or removed_keys:
+                changed = True
+                self._changed.set()
             for key in current_keys:
                 if key in self._states:
                     self._states[key].touch()
                 else:
                     self._states[key] = _ConnectionState()
-            for key, state in self._states.items():
-                if key not in current_keys and state.is_active:
-                    state.mark_removed()
+            for key in removed_keys:
+                if self._states[key].is_active:
+                    self._states[key].mark_removed()
+        return changed
 
     def contains(self, key: Tuple[str, str, int, str, int]) -> bool:
         with self._lock:
@@ -119,6 +129,20 @@ class ConnectionTracker:
             state = self._states.get(key)
             if state:
                 state.touch()
+
+    def get_active_tuples(self) -> Set[ConnectionTuple]:
+        tuples: Set[ConnectionTuple] = set()
+        with self._lock:
+            for (proto, lip, lport, rip, rport), state in self._states.items():
+                if state.is_within_grace_period(self._grace_seconds):
+                    tuples.add(ConnectionTuple(
+                        protocol=proto,
+                        local_ip=lip,
+                        local_port=lport,
+                        remote_ip=rip,
+                        remote_port=rport
+                    ))
+        return tuples
 
     def get_active_ports(self) -> Set[int]:
         ports: Set[int] = set()
@@ -145,6 +169,12 @@ class ConnectionTracker:
                 if s.is_within_grace_period(self._grace_seconds)
             )
 
+    def clear_change_flag(self):
+        self._changed.clear()
+
+    def wait_for_change(self, timeout: float) -> bool:
+        return self._changed.wait(timeout=timeout)
+
 
 class TrafficCapture:
     def __init__(self, tracker: ProcessTracker):
@@ -152,13 +182,16 @@ class TrafficCapture:
         self.packets: List[PacketRecord] = []
         self.remote_endpoints: Set[str] = set()
         self._stop_event = threading.Event()
-        self._sniff_thread: Optional[threading.Thread] = None
         self._conn_poll_thread: Optional[threading.Thread] = None
         self._connection_tracker = ConnectionTracker(grace_seconds=GRACE_PERIOD_SECONDS)
         self._lock = threading.Lock()
         self._local_ip_cache: Set[str] = set()
         self._discarded_packets = 0
         self._accepted_packets = 0
+        self._engine: Optional[CaptureEngine] = None
+        self._engine_reqs: List[str] = []
+        self._bpf_monitor_thread: Optional[threading.Thread] = None
+        self._current_bpf = ""
 
     def _get_local_ips(self) -> Set[str]:
         ips = set()
@@ -179,63 +212,57 @@ class TrafficCapture:
         self._local_ip_cache = ips
         return ips
 
-    def _refresh_connections(self):
+    def _refresh_connections(self) -> bool:
         try:
             tuples = self.tracker.get_active_connection_tuples(include_dying=False)
-            self._connection_tracker.sync_from(tuples)
+            changed = self._connection_tracker.sync_from(tuples)
             self._connection_tracker.purge_expired()
+            return changed
         except Exception:
-            pass
+            return False
 
     def _conn_poll_worker(self):
         while not self._stop_event.is_set():
             self._refresh_connections()
             self._stop_event.wait(CONNECTION_POLL_INTERVAL)
 
-    def _match_process_packet(self, pkt) -> Optional[PacketRecord]:
-        if not (IP in pkt or IPv6 in pkt):
-            return None
+    def _build_precise_bpf(self) -> str:
+        if not self._engine:
+            return ""
+        active_tuples = self._connection_tracker.get_active_tuples()
+        bpf = self._engine.build_bpf_filter(active_tuples)
+        return bpf
 
-        ip_layer = pkt[IP] if IP in pkt else pkt[IPv6]
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
+    def _bpf_monitor_worker(self):
+        while not self._stop_event.is_set():
+            changed = self._connection_tracker.wait_for_change(timeout=BPF_REFRESH_INTERVAL)
+            if self._stop_event.is_set():
+                break
+            if changed:
+                self._connection_tracker.clear_change_flag()
+                new_bpf = self._build_precise_bpf()
+                if new_bpf and new_bpf != self._current_bpf:
+                    self._current_bpf = new_bpf
+                    print(f"[*] BPF 已更新（{self._connection_tracker.active_count()} 个活跃连接）")
 
-        protocol = None
-        src_port = None
-        dst_port = None
-        payload = b""
-
-        if TCP in pkt:
-            protocol = "TCP"
-            src_port = pkt[TCP].sport
-            dst_port = pkt[TCP].dport
-            if Raw in pkt:
-                payload = bytes(pkt[Raw].load)
-        elif UDP in pkt:
-            protocol = "UDP"
-            src_port = pkt[UDP].sport
-            dst_port = pkt[UDP].dport
-            if Raw in pkt:
-                payload = bytes(pkt[Raw].load)
-        else:
-            return None
-
+    def _match_process_packet(self, meta: RawPacketMeta) -> Optional[PacketRecord]:
         local_ips = self._local_ip_cache or self._get_local_ips()
-
         direction = None
-        if src_ip in local_ips:
+        ct = None
+
+        if meta.src_ip in local_ips:
             direction = "outbound"
             ct = ConnectionTuple(
-                protocol=protocol,
-                local_ip=src_ip, local_port=src_port,
-                remote_ip=dst_ip, remote_port=dst_port
+                protocol=meta.protocol,
+                local_ip=meta.src_ip, local_port=meta.src_port,
+                remote_ip=meta.dst_ip, remote_port=meta.dst_port
             )
-        elif dst_ip in local_ips:
+        elif meta.dst_ip in local_ips:
             direction = "inbound"
             ct = ConnectionTuple(
-                protocol=protocol,
-                local_ip=dst_ip, local_port=dst_port,
-                remote_ip=src_ip, remote_port=src_port
+                protocol=meta.protocol,
+                local_ip=meta.dst_ip, local_port=meta.dst_port,
+                remote_ip=meta.src_ip, remote_port=meta.src_port
             )
         else:
             return None
@@ -248,17 +275,17 @@ class TrafficCapture:
         self._accepted_packets += 1
 
         return PacketRecord(
-            timestamp=datetime.now(),
-            src_ip=src_ip, src_port=src_port,
-            dst_ip=dst_ip, dst_port=dst_port,
-            protocol=protocol,
-            payload=payload,
+            timestamp=meta.timestamp,
+            src_ip=meta.src_ip, src_port=meta.src_port,
+            dst_ip=meta.dst_ip, dst_port=meta.dst_port,
+            protocol=meta.protocol,
+            payload=meta.payload,
             direction=direction,
             connection_key=ct.key
         )
 
-    def _packet_callback(self, pkt):
-        record = self._match_process_packet(pkt)
+    def _packet_callback(self, meta: RawPacketMeta):
+        record = self._match_process_packet(meta)
         if record:
             with self._lock:
                 self.packets.append(record)
@@ -286,8 +313,11 @@ class TrafficCapture:
             print(f"[*] 后验清理：剔除 {removed} 个无法回溯到目标进程的可疑包")
 
     def start(self, duration: Optional[int] = None):
-        if not SCAPY_AVAILABLE:
-            raise RuntimeError("scapy 未安装，无法进行流量捕获。请运行: pip install scapy")
+        self._engine, self._engine_reqs = get_best_engine()
+        print(f"[*] 抓包引擎: {self._engine.name}")
+        if self._engine.name == "scapy":
+            print(f"[!] 警告：正在使用纯 Python scapy 引擎。强烈建议安装 tshark/dumpcap")
+            print(f"[!] 以启用 C 级 BPF 过滤，大幅降低 CPU 占用。")
 
         self._get_local_ips()
         self._refresh_connections()
@@ -297,27 +327,23 @@ class TrafficCapture:
         else:
             print(f"[*] 已锁定 {self._connection_tracker.active_count()} 个活跃连接（五元组精确追踪）")
 
+        self._current_bpf = self._build_precise_bpf()
+        if self._current_bpf:
+            print(f"[*] BPF 过滤已下沉到内核/C 层（共 {len(self._current_bpf)} 字符）")
+
         self._stop_event.clear()
 
         self._conn_poll_thread = threading.Thread(target=self._conn_poll_worker, daemon=True)
         self._conn_poll_thread.start()
 
-        bpf_filter = self._build_bpf_filter()
+        self._bpf_monitor_thread = threading.Thread(target=self._bpf_monitor_worker, daemon=True)
+        self._bpf_monitor_thread.start()
 
-        def sniff_target():
-            try:
-                sniff(
-                    filter=bpf_filter if bpf_filter else None,
-                    prn=self._packet_callback,
-                    store=False,
-                    stop_filter=lambda x: self._stop_event.is_set()
-                )
-            except Exception as e:
-                print(f"[!] 抓包错误: {e}")
-                print("[!] 提示：Windows 下需要安装 Npcap (https://npcap.com/)，且需以管理员权限运行")
-
-        self._sniff_thread = threading.Thread(target=sniff_target, daemon=True)
-        self._sniff_thread.start()
+        self._engine.start(
+            bpf_filter=self._current_bpf,
+            callback=self._packet_callback,
+            stop_event=self._stop_event
+        )
 
         if duration:
             print(f"[*] 开始捕获流量，持续 {duration} 秒...")
@@ -326,21 +352,14 @@ class TrafficCapture:
         else:
             print("[*] 开始捕获流量，按 Ctrl+C 停止...")
 
-    def _build_bpf_filter(self) -> str:
-        ports = list(self._connection_tracker.get_active_ports())
-        if not ports:
-            return ""
-        port_filters = []
-        for p in ports:
-            port_filters.append(f"port {p}")
-        return " or ".join(port_filters)
-
     def stop(self):
         self._stop_event.set()
-        if self._sniff_thread:
-            self._sniff_thread.join(timeout=5)
+        if self._engine:
+            self._engine.stop()
         if self._conn_poll_thread:
             self._conn_poll_thread.join(timeout=3)
+        if self._bpf_monitor_thread:
+            self._bpf_monitor_thread.join(timeout=3)
         self._post_hoc_validate()
         if self._discarded_packets > 0:
             print(f"[*] 过滤统计：接受 {self._accepted_packets} 个包，丢弃 {self._discarded_packets} 个不匹配五元组的包")
